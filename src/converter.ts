@@ -101,13 +101,24 @@ export function convertToCursorRequest(req: AnthropicRequest): CursorChatRequest
     const messages: CursorMessage[] = [];
     const hasTools = req.tools && req.tools.length > 0;
 
+    // Inject system prompt explicitly
+    let combinedSystem = '';
+    if (req.system) {
+        if (typeof req.system === 'string') combinedSystem = req.system;
+        else if (Array.isArray(req.system)) {
+            combinedSystem = req.system.filter(b => b.type === 'text').map(b => b.text).join('\n');
+        }
+    }
+
     if (hasTools) {
         // 过滤到核心工具
         const coreTools = filterCoreTools(req.tools!);
         console.log(`[Converter] 工具: ${req.tools!.length} → ${coreTools.length} (过滤到核心)`);
 
         const hasCommunicationTool = coreTools.some(t => ['attempt_completion', 'ask_followup_question', 'AskFollowupQuestion'].includes(t.name));
-        const toolInstructions = buildToolInstructions(coreTools, hasCommunicationTool);
+        let toolInstructions = buildToolInstructions(coreTools, hasCommunicationTool);
+
+        toolInstructions = combinedSystem + '\n\n---\n\n' + toolInstructions;
 
         // 动态选取第一个工具做 few-shot 示例
         const exampleTool = coreTools[0];
@@ -140,28 +151,59 @@ export function convertToCursorRequest(req: AnthropicRequest): CursorChatRequest
             id: shortId(),
             role: 'assistant',
         });
-    }
 
-    // 转换实际的用户/助手消息
-    for (const msg of req.messages) {
-        let text = extractMessageText(msg);
-        if (!text) continue;
+        // 转换实际的用户/助手消息
+        for (const msg of req.messages) {
+            let text = extractMessageText(msg);
+            if (!text) continue;
 
-        // 在每条用户消息末尾追加格式提醒
-        if (hasTools && msg.role === 'user') {
-            const hasCommunicationTool = req.tools!.some(t => ['attempt_completion', 'ask_followup_question', 'AskFollowupQuestion'].includes(t.name));
-            if (hasCommunicationTool) {
-                text += '\n\n[Reminder: You can output multiple ```json action blocks to run tools in parallel. If you want to respond, use AskFollowupQuestion, DO NOT use Bash commands for chat.]';
-            } else {
-                text += '\n\n[Reminder: Output one or multiple ```json action blocks to take actions. To reply with text only, DO NOT output any action block.]';
+            // 在每条用户消息末尾追加格式提醒与身份抑制指令
+            if (msg.role === 'user') {
+                text += '\n\n[IMPORTANT: Do NOT introduce yourself or mention your identity. Do NOT use conversational filler. Only output the requested information directly.]';
+
+                if (hasCommunicationTool) {
+                    text += '\n\n[Reminder: You can output multiple ```json action blocks to run tools in parallel. If you want to respond, use AskFollowupQuestion, DO NOT use Bash commands for chat.]';
+                } else if (hasTools) {
+                    text += '\n\n[Reminder: Output one or multiple ```json action blocks to take actions. To reply with text only, DO NOT output any action block.]';
+                }
             }
+
+            messages.push({
+                parts: [{ type: 'text', text }],
+                id: shortId(),
+                role: msg.role,
+            });
+        }
+    } else {
+        // 没有工具时，将系统提示词作为第一条用户消息的内容或者前缀
+        let injected = false;
+        for (const msg of req.messages) {
+            let text = extractMessageText(msg);
+            if (!text) continue;
+
+            if (msg.role === 'user') {
+                if (!injected) {
+                    text = combinedSystem + '\n\n---\n\n' + text;
+                    injected = true;
+                }
+                text += '\n\n[IMPORTANT: Do NOT introduce yourself or mention your identity. Do NOT use conversational filler. Only output the requested information directly.]';
+            }
+
+            messages.push({
+                parts: [{ type: 'text', text }],
+                id: shortId(),
+                role: msg.role,
+            });
         }
 
-        messages.push({
-            parts: [{ type: 'text', text }],
-            id: shortId(),
-            role: msg.role,
-        });
+        // 如果根本没有用户消息，补充一条包含系统提示词的消息
+        if (!injected) {
+            messages.unshift({
+                parts: [{ type: 'text', text: combinedSystem }],
+                id: shortId(),
+                role: 'user',
+            });
+        }
     }
 
     return {
