@@ -12,15 +12,7 @@ npm-debug.log
 
 # 构建中间产物和测试文件
 deploy.sh
-*.zip
-*.tar.gz
+cursor2api_deployment.zip
 test*.txt
-
-# Docker 自身配置（避免递归）
-Dockerfile
-docker-compose.yml
-.dockerignore
-
-# 文档
-README.md
-LICENSE
+data
+docs

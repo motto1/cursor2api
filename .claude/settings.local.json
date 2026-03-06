@@ -4,8 +4,7 @@
       "Bash(dir e:\\\\CodeAI\\\\github\\\\cursor2api:*)",
       "Bash(cmd:*)",
       "WebFetch(domain:wttr.in)",
-      "mcp__fetch__fetch",
-      "mcp__filesystem__directory_tree"
+      "mcp__fetch__fetch"
     ]
   }
 }
