@@ -1,0 +1,157 @@
+name: sync-upstream-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream branch or ref to sync from
+        required: false
+        default: main
+      target_branch:
+        description: Fork branch to update
+        required: false
+        default: main
+      publish_docker:
+        description: Dispatch docker.yml after a successful sync
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      new_main_sha: ${{ steps.sync.outputs.new_main_sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream into fork
+        id: sync
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
+          UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
+          PUBLISH_DOCKER: ${{ github.event.inputs.publish_docker || 'true' }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_URL="https://github.com/7836246/cursor2api.git"
+          KEEP_PATHS=(
+            "gateway"
+            "docker-compose.yml"
+            ".dockerignore"
+            ".gitignore"
+            ".github/workflows/docker.yml"
+            ".github/workflows/sync-upstream-manual.yml"
+            "docs/IMPLEMENTATION_PLAN.md"
+            "docs/MANUAL_UPSTREAM_SYNC.md"
+            "docs/SIDECAR_ARCHITECTURE.md"
+          )
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --prune origin "$TARGET_BRANCH"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+          git fetch --prune upstream "$UPSTREAM_REF"
+
+          CURRENT_MAIN_SHA="$(git rev-parse "origin/${TARGET_BRANCH}")"
+          UPSTREAM_SHA="$(git rev-parse "upstream/${UPSTREAM_REF}")"
+
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$CURRENT_MAIN_SHA"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "new_main_sha=$CURRENT_MAIN_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout --detach "$UPSTREAM_SHA"
+
+          for path in "${KEEP_PATHS[@]}"; do
+            if git cat-file -e "${CURRENT_MAIN_SHA}:${path}" 2>/dev/null; then
+              git checkout "$CURRENT_MAIN_SHA" -- "$path"
+            fi
+          done
+
+          TREE_SHA="$(git write-tree)"
+          CURRENT_TREE_SHA="$(git rev-parse "${CURRENT_MAIN_SHA}^{tree}")"
+
+          if [ "$TREE_SHA" = "$CURRENT_TREE_SHA" ]; then
+            COMMIT_MESSAGE="chore(sync): mark upstream ${UPSTREAM_REF} as synced"
+          else
+            COMMIT_MESSAGE="chore(sync): sync upstream/${UPSTREAM_REF} and reapply sidecar overlay"
+          fi
+
+          NEW_MAIN_SHA="$(printf '%s\n' "$COMMIT_MESSAGE" | git commit-tree "$TREE_SHA" -p "$CURRENT_MAIN_SHA" -p "$UPSTREAM_SHA")"
+          git push origin "${NEW_MAIN_SHA}:refs/heads/${TARGET_BRANCH}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "new_main_sha=$NEW_MAIN_SHA" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Upstream sync"
+            echo "- status: synced"
+            echo "- target branch: $TARGET_BRANCH"
+            echo "- previous main: $CURRENT_MAIN_SHA"
+            echo "- upstream ref: $UPSTREAM_REF"
+            echo "- upstream sha: $UPSTREAM_SHA"
+            echo "- new main: $NEW_MAIN_SHA"
+            echo "- publish docker: $PUBLISH_DOCKER"
+            echo "- preserved paths: gateway/, docker-compose.yml, .github/workflows/*, docs/*, .dockerignore, .gitignore"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record no-op summary
+        if: steps.sync.outputs.changed != 'true'
+        env:
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
+          UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
+          PUBLISH_DOCKER: ${{ github.event.inputs.publish_docker || 'true' }}
+        run: |
+          {
+            echo "## Upstream sync"
+            echo "- status: already up to date"
+            echo "- target branch: $TARGET_BRANCH"
+            echo "- current main: ${{ steps.sync.outputs.new_main_sha }}"
+            echo "- upstream ref: $UPSTREAM_REF"
+            echo "- upstream sha: ${{ steps.sync.outputs.upstream_sha }}"
+            echo "- publish docker: $PUBLISH_DOCKER"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dispatch docker workflow
+        if: steps.sync.outputs.changed == 'true' && (github.event.inputs.publish_docker == 'true' || github.event.inputs.publish_docker == '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run docker.yml --repo "${GITHUB_REPOSITORY}" --ref "${{ github.event.inputs.target_branch || 'main' }}"
+
+      - name: Note docker dispatch result
+        if: steps.sync.outputs.changed == 'true' && (github.event.inputs.publish_docker == 'true' || github.event.inputs.publish_docker == '')
+        run: |
+          {
+            echo "## Docker publish"
+            echo "- status: dispatched"
+            echo "- workflow: docker.yml"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Note docker dispatch skipped
+        if: steps.sync.outputs.changed != 'true' || (github.event.inputs.publish_docker != 'true' && github.event.inputs.publish_docker != '')
+        run: |
+          {
+            echo "## Docker publish"
+            echo "- status: skipped"
+          } >> "$GITHUB_STEP_SUMMARY"
