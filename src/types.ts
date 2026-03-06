@@ -91,16 +91,6 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     cursorModel: string;
-    admin: {
-        enabled: boolean;
-        path: string;
-    };
-    observability: {
-        enabled: boolean;
-        maxRequests: number;
-        logDir: string;
-        persistJsonl: boolean;
-    };
     fingerprint: {
         userAgent: string;
     };

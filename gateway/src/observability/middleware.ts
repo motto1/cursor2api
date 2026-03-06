@@ -1,15 +1,15 @@
 import { randomUUID } from 'crypto';
 import { Buffer } from 'buffer';
 import type { Request, RequestHandler } from 'express';
-import type { AppConfig } from '../types.js';
+import type { GatewayConfig } from '../types.js';
 import { RequestStore } from './request-store.js';
 import type { RequestProvider } from './types.js';
 
-export function createObservabilityMiddleware(config: AppConfig, store: RequestStore): RequestHandler {
+export function createObservabilityMiddleware(config: GatewayConfig, store: RequestStore): RequestHandler {
     return (req, res, next) => {
         const requestPath = getRequestPath(req);
 
-        if (!config.observability.enabled || shouldIgnoreRequest(requestPath, config.admin.path)) {
+        if (!config.observability.enabled || shouldIgnoreRequest(requestPath, config.adminPath)) {
             next();
             return;
         }
@@ -26,6 +26,12 @@ export function createObservabilityMiddleware(config: AppConfig, store: RequestS
             errorMessage = errorMessage ?? inferErrorMessage(body);
             return originalJson(body);
         }) as typeof res.json;
+
+        const originalSend = res.send.bind(res);
+        res.send = ((body?: unknown) => {
+            errorMessage = errorMessage ?? inferSendErrorMessage(body, res.statusCode);
+            return originalSend(body as never);
+        }) as typeof res.send;
 
         const originalWrite = res.write.bind(res);
         res.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
@@ -71,8 +77,7 @@ export function createObservabilityMiddleware(config: AppConfig, store: RequestS
 }
 
 function shouldIgnoreRequest(requestPath: string, adminPath: string): boolean {
-    if (!requestPath.startsWith(adminPath)) return false;
-    return !requestPath.startsWith(`${adminPath}/api`);
+    return requestPath.startsWith(adminPath);
 }
 
 function inferRequestMeta(req: Request, requestPath: string): { provider: RequestProvider; model?: string; stream?: boolean } {
@@ -106,6 +111,17 @@ function inferErrorMessage(body: unknown): string | undefined {
 
     const message = (body as { message?: unknown }).message;
     return typeof message === 'string' ? message : undefined;
+}
+
+function inferSendErrorMessage(body: unknown, statusCode: number): string | undefined {
+    if (statusCode < 400 || typeof body !== 'string') return undefined;
+
+    try {
+        const parsed = JSON.parse(body) as { error?: { message?: string }; message?: string };
+        return parsed.error?.message || parsed.message || body.substring(0, 200);
+    } catch {
+        return body.substring(0, 200);
+    }
 }
 
 function inferSseErrorMessage(value: string): string | undefined {

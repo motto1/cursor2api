@@ -1,10 +1,10 @@
 import { Router } from 'express';
-import type { AppConfig } from '../types.js';
+import type { GatewayConfig } from '../types.js';
 import { RequestStore } from '../observability/request-store.js';
 import { buildEndpointCatalog } from './endpoints.js';
 
 interface AdminRouterOptions {
-    config: AppConfig;
+    config: GatewayConfig;
     store: RequestStore;
     version: string;
 }
@@ -12,12 +12,18 @@ interface AdminRouterOptions {
 export function createAdminRouter({ config, store, version }: AdminRouterOptions): Router {
     const router = Router();
 
-    router.get('/api/health', (_req, res) => {
-        res.json({ status: 'ok', version, adminPath: config.admin.path });
+    router.get('/api/health', async (_req, res) => {
+        const upstream = await fetchUpstreamSnapshot(config.upstreamBaseUrl);
+        res.json({
+            status: 'ok',
+            version,
+            adminPath: config.adminPath,
+            upstream,
+        });
     });
 
     router.get('/api/endpoints', (_req, res) => {
-        res.json({ items: buildEndpointCatalog(config.admin.path) });
+        res.json({ items: buildEndpointCatalog(config.adminPath) });
     });
 
     router.get('/api/requests', (req, res) => {
@@ -62,7 +68,7 @@ export function createAdminRouter({ config, store, version }: AdminRouterOptions
             latestError: stats.recentErrors[0]?.error ?? '暂无错误',
             healthStatus: 'ok',
             version,
-            endpointCount: buildEndpointCatalog(config.admin.path).length,
+            endpointCount: buildEndpointCatalog(config.adminPath).length,
             successCount: stats.successCount,
             failureCount: stats.failureCount,
             byPath: stats.byPath,
@@ -71,4 +77,25 @@ export function createAdminRouter({ config, store, version }: AdminRouterOptions
     });
 
     return router;
+}
+
+async function fetchUpstreamSnapshot(upstreamBaseUrl: string): Promise<{ status: string; version?: string }> {
+    try {
+        const response = await fetch(new URL('/health', ensureTrailingSlash(upstreamBaseUrl)));
+        if (!response.ok) {
+            return { status: `error:${response.status}` };
+        }
+
+        const payload = await response.json() as { status?: string; version?: string };
+        return {
+            status: payload.status || 'ok',
+            version: payload.version,
+        };
+    } catch {
+        return { status: 'unreachable' };
+    }
+}
+
+function ensureTrailingSlash(baseUrl: string): string {
+    return baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
 }

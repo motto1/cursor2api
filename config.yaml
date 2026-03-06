@@ -12,18 +12,6 @@ timeout: 120
 # Cursor 使用的模型
 cursor_model: "anthropic/claude-sonnet-4.6"
 
-# 管理界面（只读观测）
-admin:
-  enabled: true
-  path: "/admin"
-
-# 请求观测
-observability:
-  enabled: true
-  max_requests: 500
-  log_dir: "./data"
-  persist_jsonl: true
-
 # 浏览器指纹配置
 fingerprint:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
