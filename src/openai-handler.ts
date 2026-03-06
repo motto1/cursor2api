@@ -19,12 +19,22 @@ import type {
     AnthropicMessage,
     AnthropicContentBlock,
     AnthropicTool,
+    CursorChatRequest,
     CursorSSEEvent,
 } from './types.js';
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
-import { applyVisionInterceptor } from './vision.js';
+import {
+    isRefusal,
+    sanitizeResponse,
+    isIdentityProbe,
+    isToolCapabilityQuestion,
+    buildRetryRequest,
+    CLAUDE_IDENTITY_RESPONSE,
+    CLAUDE_TOOLS_RESPONSE,
+    MAX_REFUSAL_RETRIES,
+} from './handler.js';
 
 function chatId(): string {
     return 'chatcmpl-' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -183,16 +193,26 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
         // Step 1: OpenAI → Anthropic 格式
         const anthropicReq = convertToAnthropicRequest(body);
 
-        // Step 1.5: 应用视觉拦截器（如果启用，会将 anthropicReq 中的 image 转换为 text）
-        await applyVisionInterceptor(anthropicReq.messages);
+        // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
+
+        // Step 1.6: 身份探针拦截（复用 Anthropic handler 的逻辑）
+        if (isIdentityProbe(anthropicReq)) {
+            console.log(`[OpenAI] 拦截到身份探针，返回模拟响应`);
+            const mockText = "I am Claude, an advanced AI programming assistant created by Anthropic. I am ready to help you write code, debug, and answer your technical questions. Please let me know what we should work on!";
+            if (body.stream) {
+                return handleOpenAIMockStream(res, body, mockText);
+            } else {
+                return handleOpenAIMockNonStream(res, body, mockText);
+            }
+        }
 
         // Step 2: Anthropic → Cursor 格式（复用现有管道）
-        const cursorReq = convertToCursorRequest(anthropicReq);
+        const cursorReq = await convertToCursorRequest(anthropicReq);
 
         if (body.stream) {
-            await handleOpenAIStream(res, cursorReq, body);
+            await handleOpenAIStream(res, cursorReq, body, anthropicReq);
         } else {
-            await handleOpenAINonStream(res, cursorReq, body);
+            await handleOpenAINonStream(res, cursorReq, body, anthropicReq);
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -207,12 +227,51 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
     }
 }
 
+// ==================== 身份探针模拟响应 ====================
+
+function handleOpenAIMockStream(res: Response, body: OpenAIChatRequest, mockText: string): void {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+    const id = chatId();
+    const created = Math.floor(Date.now() / 1000);
+    writeOpenAISSE(res, {
+        id, object: 'chat.completion.chunk', created, model: body.model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: mockText }, finish_reason: null }],
+    });
+    writeOpenAISSE(res, {
+        id, object: 'chat.completion.chunk', created, model: body.model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    });
+    res.write('data: [DONE]\n\n');
+    res.end();
+}
+
+function handleOpenAIMockNonStream(res: Response, body: OpenAIChatRequest, mockText: string): void {
+    res.json({
+        id: chatId(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [{
+            index: 0,
+            message: { role: 'assistant', content: mockText },
+            finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 15, completion_tokens: 35, total_tokens: 50 },
+    });
+}
+
 // ==================== 流式处理（OpenAI SSE 格式） ====================
 
 async function handleOpenAIStream(
     res: Response,
-    cursorReq: ReturnType<typeof convertToCursorRequest>,
+    cursorReq: CursorChatRequest,
     body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
 ): Promise<void> {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -226,7 +285,7 @@ async function handleOpenAIStream(
     const model = body.model;
     const hasTools = (body.tools?.length ?? 0) > 0;
 
-    // 发送 role delta（OpenAI 流式第一个 chunk 通常包含 role）
+    // 发送 role delta
     writeOpenAISSE(res, {
         id, object: 'chat.completion.chunk', created, model,
         choices: [{
@@ -238,31 +297,41 @@ async function handleOpenAIStream(
 
     let fullResponse = '';
     let sentText = '';
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+
+    // 统一缓冲模式：先缓冲全部响应，再检测拒绝和处理
+    const executeStream = async () => {
+        fullResponse = '';
+        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+            fullResponse += event.delta;
+        });
+    };
 
     try {
-        await sendCursorRequest(cursorReq, (event: CursorSSEEvent) => {
-            if (event.type !== 'text-delta' || !event.delta) return;
+        await executeStream();
 
-            fullResponse += event.delta;
-
-            // 工具模式：缓冲直到完成
-            if (hasTools && hasToolCalls(fullResponse)) {
-                return;
+        // 无工具模式：检测拒绝并自动重试
+        if (!hasTools) {
+            while (isRefusal(fullResponse) && retryCount < MAX_REFUSAL_RETRIES) {
+                retryCount++;
+                console.log(`[OpenAI] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 80)}...`);
+                const retryBody = buildRetryRequest(anthropicReq, retryCount - 1);
+                activeCursorReq = await convertToCursorRequest(retryBody);
+                await executeStream();
             }
+            if (isRefusal(fullResponse)) {
+                if (isToolCapabilityQuestion(anthropicReq)) {
+                    console.log(`[OpenAI] 工具能力询问被拒绝，返回 Claude 能力描述`);
+                    fullResponse = CLAUDE_TOOLS_RESPONSE;
+                } else {
+                    console.log(`[OpenAI] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                    fullResponse = CLAUDE_IDENTITY_RESPONSE;
+                }
+            }
+        }
 
-            // 实时流式推送文本
-            writeOpenAISSE(res, {
-                id, object: 'chat.completion.chunk', created, model,
-                choices: [{
-                    index: 0,
-                    delta: { content: event.delta },
-                    finish_reason: null,
-                }],
-            });
-            sentText += event.delta;
-        });
-
-        // 流完成后处理
         let finishReason: 'stop' | 'tool_calls' = 'stop';
 
         if (hasTools && hasToolCalls(fullResponse)) {
@@ -271,16 +340,15 @@ async function handleOpenAIStream(
             if (toolCalls.length > 0) {
                 finishReason = 'tool_calls';
 
-                // 发送工具调用前的剩余文本
-                const matchLen = findMatchLength(cleanText, sentText);
-                const unsentCleanText = cleanText.substring(matchLen).trim();
-
-                if (unsentCleanText) {
+                // 发送工具调用前的残余文本（清洗后）
+                let cleanOutput = isRefusal(cleanText) ? '' : cleanText;
+                cleanOutput = sanitizeResponse(cleanOutput);
+                if (cleanOutput) {
                     writeOpenAISSE(res, {
                         id, object: 'chat.completion.chunk', created, model,
                         choices: [{
                             index: 0,
-                            delta: { content: unsentCleanText },
+                            delta: { content: cleanOutput },
                             finish_reason: null,
                         }],
                     });
@@ -289,7 +357,6 @@ async function handleOpenAIStream(
                 // 发送每个工具调用
                 for (let i = 0; i < toolCalls.length; i++) {
                     const tc = toolCalls[i];
-                    // 工具调用开始（包含 id、name）
                     writeOpenAISSE(res, {
                         id, object: 'chat.completion.chunk', created, model,
                         choices: [{
@@ -310,18 +377,34 @@ async function handleOpenAIStream(
                     });
                 }
             } else {
-                // 误报：发送剩余文本
-                const unsentText = fullResponse.substring(sentText.length);
-                if (unsentText) {
-                    writeOpenAISSE(res, {
-                        id, object: 'chat.completion.chunk', created, model,
-                        choices: [{
-                            index: 0,
-                            delta: { content: unsentText },
-                            finish_reason: null,
-                        }],
-                    });
+                // 误报：发送清洗后的文本
+                let textToSend = fullResponse;
+                if (isRefusal(fullResponse)) {
+                    textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
+                } else {
+                    textToSend = sanitizeResponse(fullResponse);
                 }
+                writeOpenAISSE(res, {
+                    id, object: 'chat.completion.chunk', created, model,
+                    choices: [{
+                        index: 0,
+                        delta: { content: textToSend },
+                        finish_reason: null,
+                    }],
+                });
+            }
+        } else {
+            // 无工具模式或无工具调用 — 统一清洗后发送
+            const sanitized = sanitizeResponse(fullResponse);
+            if (sanitized) {
+                writeOpenAISSE(res, {
+                    id, object: 'chat.completion.chunk', created, model,
+                    choices: [{
+                        index: 0,
+                        delta: { content: sanitized },
+                        finish_reason: null,
+                    }],
+                });
             }
         }
 
@@ -335,12 +418,10 @@ async function handleOpenAIStream(
             }],
         });
 
-        // OpenAI 流式结束标志
         res.write('data: [DONE]\n\n');
 
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        // 在流中发送错误（非标准，但部分客户端可以处理）
         writeOpenAISSE(res, {
             id, object: 'chat.completion.chunk', created, model,
             choices: [{
@@ -359,13 +440,34 @@ async function handleOpenAIStream(
 
 async function handleOpenAINonStream(
     res: Response,
-    cursorReq: ReturnType<typeof convertToCursorRequest>,
+    cursorReq: CursorChatRequest,
     body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
 ): Promise<void> {
-    const fullText = await sendCursorRequestFull(cursorReq);
+    let fullText = await sendCursorRequestFull(cursorReq);
     const hasTools = (body.tools?.length ?? 0) > 0;
 
     console.log(`[OpenAI] 原始响应 (${fullText.length} chars): ${fullText.substring(0, 300)}...`);
+
+    // 无工具模式：检测拒绝并自动重试
+    if (!hasTools && isRefusal(fullText)) {
+        for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
+            console.log(`[OpenAI] 非流式：检测到拒绝（第${attempt + 1}次重试）...原始: ${fullText.substring(0, 80)}...`);
+            const retryBody = buildRetryRequest(anthropicReq, attempt);
+            const retryCursorReq = await convertToCursorRequest(retryBody);
+            fullText = await sendCursorRequestFull(retryCursorReq);
+            if (!isRefusal(fullText)) break;
+        }
+        if (isRefusal(fullText)) {
+            if (isToolCapabilityQuestion(anthropicReq)) {
+                console.log(`[OpenAI] 非流式：工具能力询问被拒绝，返回 Claude 能力描述`);
+                fullText = CLAUDE_TOOLS_RESPONSE;
+            } else {
+                console.log(`[OpenAI] 非流式：重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                fullText = CLAUDE_IDENTITY_RESPONSE;
+            }
+        }
+    }
 
     let content: string | null = fullText;
     let toolCalls: OpenAIToolCall[] | undefined;
@@ -376,7 +478,13 @@ async function handleOpenAINonStream(
 
         if (parsed.toolCalls.length > 0) {
             finishReason = 'tool_calls';
-            content = parsed.cleanText || null;
+            // 清洗拒绝文本
+            let cleanText = parsed.cleanText;
+            if (isRefusal(cleanText)) {
+                console.log(`[OpenAI] 抑制工具模式下的拒绝文本: ${cleanText.substring(0, 100)}...`);
+                cleanText = '';
+            }
+            content = sanitizeResponse(cleanText) || null;
 
             toolCalls = parsed.toolCalls.map(tc => ({
                 id: toolCallId(),
@@ -386,7 +494,17 @@ async function handleOpenAINonStream(
                     arguments: JSON.stringify(tc.arguments),
                 },
             }));
+        } else {
+            // 无工具调用，检查拒绝
+            if (isRefusal(fullText)) {
+                content = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
+            } else {
+                content = sanitizeResponse(fullText);
+            }
         }
+    } else {
+        // 无工具模式：清洗响应
+        content = sanitizeResponse(fullText);
     }
 
     const response: OpenAIChatCompletion = {

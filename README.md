@@ -1,18 +1,14 @@
 # Cursor2API v2
 
-将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，可直接对接 **Claude Code**、**ChatBox**、**LobeChat** 等各类客户端。
+将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API**，目前仅在 **Claude Code** 中效果明显。
 
 ## 原理
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐
 │ Claude Code  │────▶│              │────▶│              │
-│ (Anthropic)  │     │              │     │              │
-│              │◀────│              │◀────│              │
-├─────────────┤     │  cursor2api  │     │  Cursor API  │
-│ ChatBox 等   │────▶│  (代理+转换)  │     │  /api/chat   │
-│ (OpenAI)     │     │              │     │              │
-│              │◀────│              │◀────│              │
+│ (Anthropic)  │     │  cursor2api  │     │  Cursor API  │
+│              │◀────│  (代理+转换)  │◀────│  /api/chat   │
 └─────────────┘     └──────────────┘     └──────────────┘
 ```
 
@@ -25,9 +21,8 @@
 
 ## 核心特性
 
-- **Anthropic Messages API 完整兼容** - `/v1/messages` 流式/非流式
-- **OpenAI Chat Completions API 兼容** - `/v1/chat/completions` 流式/非流式 + 工具调用
-- **多模态视觉降级处理** - 内置纯本地 CPU OCR 图片文字提取（零配置免 Key），或支持外接第三方免费视觉大模型 API 解释图片。
+- **Anthropic Messages API 完整兼容** - `/v1/messages` 流式/非流式，直接对接 Claude Code
+- **多模态视觉降级处理** - 内置纯本地 CPU OCR 图片文字提取（零配置免 Key），或支持外接第三方免费视觉大模型 API 解释图片
 - **Cursor IDE 场景融合提示词注入** - 不覆盖模型身份，顺应 Cursor 内部角色设定
 - **全工具支持** - 无工具白名单限制，支持所有 MCP 工具和自定义扩展
 - **多层拒绝拦截** - 自动检测和抑制 Cursor 文档助手的拒绝行为
@@ -58,19 +53,14 @@ npm install
 npm run dev
 ```
 
-### 4. 配合 Claude Code
+### 4. 配合 Claude Code 使用
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:3010
 claude
 ```
 
-### 5. 配合 OpenAI 兼容客户端（ChatBox、LobeChat 等）
-
-在客户端设置中填入：
-- **API Base URL**: `http://localhost:3010/v1`
-- **API Key**: 任意值（如 `sk-xxx`，不做校验）
-- **Model**: 任意值（实际使用 config.yaml 中配置的模型）
+> ⚠️ **注意**：目前仅在 Claude Code 中验证效果明显，其他客户端暂未充分测试。
 
 ## 项目结构
 
@@ -79,12 +69,10 @@ cursor2api/
 ├── src/
 │   ├── index.ts            # 入口 + Express 服务
 │   ├── config.ts           # 配置管理
-│   ├── types.ts            # Anthropic/Cursor 类型定义
-│   ├── openai-types.ts     # OpenAI 类型定义
+│   ├── types.ts            # 类型定义
 │   ├── cursor-client.ts    # Cursor API 客户端 + Chrome TLS 指纹
 │   ├── converter.ts        # 协议转换 + 提示词注入 + 上下文清洗
-│   ├── handler.ts          # Anthropic API 处理器 + 身份保护 + 拒绝拦截
-│   └── openai-handler.ts   # OpenAI API 处理器
+│   └── handler.ts          # Anthropic API 处理器 + 身份保护 + 拒绝拦截
 ├── config.yaml             # 配置文件
 ├── package.json
 └── tsconfig.json
@@ -140,6 +128,27 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 | **L4: 响应清洗** | `handler.ts` | `sanitizeResponse()` 对所有输出做后处理，将 Cursor 身份引用替换为 Claude |
 
 ## 更新日志
+
+### v2.3.2 (2026-03-06) — 视觉预处理统一 + OpenAI 防御强化
+
+**� 视觉预处理统一化（修复 [#8](https://github.com/user/cursor2api/issues/8)）**
+- ✨ 新增 `preprocessImages()` 函数：在 `convertToCursorRequest()` 入口统一检测 Anthropic `ImageBlockParam` 图片块
+- ✨ 修复 Claude CLI 选择图片后不进 vision 预处理的 bug — 图片处理从分散的 handler 调用统一到 converter 层
+- ✨ `extractMessageText()` 新增 `case 'image':` 兜底处理，vision 关闭/失败时保留图片元信息而非静默丢弃
+- ✨ Express body 限制从 10MB → 50MB，支持大型 base64 图片传输
+- ✨ 完善日志链路：📸 检测图片 → ✅ 处理成功 / ⚠️ 残留 / ❌ 失败
+
+**�🛡️ OpenAI 端全面防御层对齐**
+- ✨ OpenAI Chat Completions API 端新增完整的拒绝检测 + 自动重试机制（与 Anthropic 端一致）
+- ✨ OpenAI 端新增响应清洗（`sanitizeResponse`），所有输出后处理替换 Cursor 身份引用为 Claude
+- ✨ OpenAI 端新增身份探针拦截（`isIdentityProbe`），拦截"你是谁"等身份询问
+- ✨ 流式模式改为统一缓冲后发送，先检测拒绝再输出（与 Anthropic handler 策略同步）
+
+**🧠 非工具场景认知重构**
+- ✨ 无工具请求（如 ChatBox 纯对话）新增认知重构前缀，防止模型暴露 Cursor 文档助手身份
+- ✨ 无工具场景的助手历史消息清洗：自动替换包含 `read_file`/`read_dir` 工具声明的拒绝文本
+- ✨ 工具能力询问（"你有哪些工具"）返回 Claude 能力描述而非硬拦截
+- 🔧 解决了 ChatBox、LobeChat 等 OpenAI 兼容客户端效果差的核心问题
 
 ### v2.3.0 (2026-03-06) — 多模态视觉拦截与降级支持
 

@@ -14,8 +14,8 @@ import { handleOpenAIChatCompletions } from './openai-handler.js';
 const app = express();
 const config = getConfig();
 
-// 解析 JSON body（增大限制以支持大型消息）
-app.use(express.json({ limit: '10mb' }));
+// 解析 JSON body（增大限制以支持 base64 图片，单张图片可达 10MB+）
+app.use(express.json({ limit: '50mb' }));
 
 // CORS
 app.use((_req, res, next) => {
@@ -48,14 +48,14 @@ app.get('/v1/models', listModels);
 
 // 健康检查
 app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', version: '2.3.0' });
+    res.json({ status: 'ok', version: '2.3.2' });
 });
 
 // 根路径
 app.get('/', (_req, res) => {
     res.json({
         name: 'cursor2api',
-        version: '2.3.0',
+        version: '2.3.2',
         description: 'Cursor Docs AI → Anthropic & OpenAI API Proxy',
         endpoints: {
             anthropic_messages: 'POST /v1/messages',
@@ -75,7 +75,7 @@ app.get('/', (_req, res) => {
 app.listen(config.port, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
-    console.log('  ║        Cursor2API v2.3.0             ║');
+    console.log('  ║        Cursor2API v2.3.2             ║');
     console.log('  ╠══════════════════════════════════════╣');
     console.log(`  ║  Server:  http://localhost:${config.port}      ║`);
     console.log('  ║  Model:   ' + config.cursorModel.padEnd(26) + '║');
