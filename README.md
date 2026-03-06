@@ -69,6 +69,101 @@ claude
 - **API Key**: 任意值（如 `sk-xxx`，不做校验）
 - **Model**: 任意值（实际使用 config.yaml 中配置的模型）
 
+## 管理界面
+
+项目现已提供一个低侵入、只读的管理界面，用于展示接口清单、最近调用、聚合统计与最近错误。
+
+- **管理入口**: `http://localhost:3010/admin`
+- **管理接口**:
+  - `GET /admin/api/endpoints`
+  - `GET /admin/api/requests`
+  - `GET /admin/api/stats`
+  - `GET /admin/api/health`
+
+默认情况下，请求观测会记录以下摘要字段：
+
+- 请求时间、方法、路径、状态码、耗时
+- 客户端 IP、User-Agent、provider、model、stream
+- 错误摘要（若存在）
+
+为避免敏感信息泄漏，默认**不落盘完整 prompt / payload 内容**，仅记录摘要信息。
+
+### 管理界面配置
+
+在 `config.yaml` 中可配置：
+
+```yaml
+admin:
+  enabled: true
+  path: "/admin"
+
+observability:
+  enabled: true
+  max_requests: 500
+  log_dir: "./data"
+  persist_jsonl: true
+```
+
+对应环境变量：
+
+- `ADMIN_ENABLED`
+- `ADMIN_PATH`
+- `OBS_ENABLED`
+- `OBS_MAX_REQUESTS`
+- `OBS_LOG_DIR`
+- `OBS_PERSIST_JSONL`
+
+## Docker / Compose
+
+### 直接运行 Docker
+
+```bash
+docker build -t cursor2api:local .
+docker run --rm -p 3010:3010 -v $(pwd)/config.yaml:/app/config.yaml:ro -v $(pwd)/data:/app/data cursor2api:local
+```
+
+### `docker compose` 一键启动
+
+```bash
+docker compose up -d
+```
+
+默认 Compose 配置会：
+
+- 拉取 `ghcr.io/motto1/cursor2api:latest`
+- 挂载 `./config.yaml` 到容器内
+- 挂载 `./data` 用于请求日志落盘
+- 暴露 `3010` 端口
+
+启动后访问：
+
+- API 根路径：`http://localhost:3010/`
+- 管理界面：`http://localhost:3010/admin`
+
+## GitHub Actions 自动打包镜像
+
+仓库新增了 `.github/workflows/docker.yml`，会在以下场景自动构建并推送镜像到 GHCR：
+
+- push 到 `main`
+- push `v*` tag
+- 手动触发 `workflow_dispatch`
+
+产物标签包括：
+
+- `ghcr.io/<owner>/cursor2api:latest`
+- `ghcr.io/<owner>/cursor2api:main`
+- `ghcr.io/<owner>/cursor2api:vX.Y.Z`
+- `ghcr.io/<owner>/cursor2api:sha-<commit>`
+
+## 上游同步建议
+
+为了降低 fork 跟随上游同步时的冲突成本，本次扩展遵循以下约束：
+
+- 新能力集中在 `src/admin/*` 与 `src/observability/*`
+- 前端采用独立静态目录 `admin-ui/`
+- 核心代理逻辑只在 `src/index.ts` 做最小接入
+- 不引入数据库或复杂前端构建链
+
 ## 项目结构
 
 ```

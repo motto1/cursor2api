@@ -14,3 +14,5 @@ npm-debug.log
 deploy.sh
 cursor2api_deployment.zip
 test*.txt
+data
+docs

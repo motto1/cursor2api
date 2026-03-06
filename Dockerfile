@@ -32,6 +32,11 @@ RUN npm ci --omit=dev \
 
 # 从 builder 阶段拷贝编译后的产物
 COPY --from=builder --chown=cursor:nodejs /app/dist ./dist
+COPY --chown=cursor:nodejs admin-ui ./admin-ui
+
+# 预创建观测日志目录
+RUN mkdir -p /app/data && chown -R cursor:nodejs /app/data
+
 # 明确并赋予权限，因为在脚本验证里我们需要写入 /tmp
 # 默认情况下 Alpine 的 /tmp 对所有用户都可写，这步安全地确保用户权限
 USER cursor
