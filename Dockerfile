@@ -32,8 +32,11 @@ RUN npm ci --omit=dev \
 
 # 从 builder 阶段拷贝编译后的产物
 COPY --from=builder --chown=cursor:nodejs /app/dist ./dist
-# 明确并赋予权限，因为在脚本验证里我们需要写入 /tmp
-# 默认情况下 Alpine 的 /tmp 对所有用户都可写，这步安全地确保用户权限
+
+# 拷贝默认配置文件（可通过 volume 挂载覆盖）
+COPY --chown=cursor:nodejs config.yaml ./config.yaml
+
+# 切换到非 root 用户
 USER cursor
 
 # 声明对外暴露的端口
