@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from 'fs';
 import { parse as parseYaml } from 'yaml';
-import type { AppConfig } from './types.js';
+import type { AppConfig, VisionProvider } from './types.js';
 
 let config: AppConfig;
 
@@ -12,6 +12,7 @@ export function getConfig(): AppConfig {
         port: 3010,
         timeout: 120,
         cursorModel: 'anthropic/claude-sonnet-4.6',
+        enableThinking: true,
         fingerprint: {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
         },
@@ -26,13 +27,35 @@ export function getConfig(): AppConfig {
             if (yaml.timeout) config.timeout = yaml.timeout;
             if (yaml.proxy) config.proxy = yaml.proxy;
             if (yaml.cursor_model) config.cursorModel = yaml.cursor_model;
+            if (yaml.enable_thinking !== undefined) config.enableThinking = yaml.enable_thinking;
             if (yaml.fingerprint) {
                 if (yaml.fingerprint.user_agent) config.fingerprint.userAgent = yaml.fingerprint.user_agent;
             }
             if (yaml.vision) {
+                // Parse providers array
+                let providers: VisionProvider[] = [];
+                if (Array.isArray(yaml.vision.providers)) {
+                    providers = yaml.vision.providers.map((p: any) => ({
+                        name: p.name || '',
+                        baseUrl: p.base_url || 'https://api.openai.com/v1/chat/completions',
+                        apiKey: p.api_key || '',
+                        model: p.model || 'gpt-4o-mini',
+                    }));
+                } else if (yaml.vision.base_url && yaml.vision.api_key) {
+                    // Backward compat: single provider from legacy fields
+                    providers = [{
+                        name: 'default',
+                        baseUrl: yaml.vision.base_url,
+                        apiKey: yaml.vision.api_key,
+                        model: yaml.vision.model || 'gpt-4o-mini',
+                    }];
+                }
+
                 config.vision = {
-                    enabled: yaml.vision.enabled !== false, // default to true if vision section exists in some way
+                    enabled: yaml.vision.enabled !== false,
                     mode: yaml.vision.mode || 'ocr',
+                    providers,
+                    fallbackToOcr: yaml.vision.fallback_to_ocr !== false, // default true
                     baseUrl: yaml.vision.base_url || 'https://api.openai.com/v1/chat/completions',
                     apiKey: yaml.vision.api_key || '',
                     model: yaml.vision.model || 'gpt-4o-mini',
@@ -48,6 +71,7 @@ export function getConfig(): AppConfig {
     if (process.env.TIMEOUT) config.timeout = parseInt(process.env.TIMEOUT);
     if (process.env.PROXY) config.proxy = process.env.PROXY;
     if (process.env.CURSOR_MODEL) config.cursorModel = process.env.CURSOR_MODEL;
+    if (process.env.ENABLE_THINKING !== undefined) config.enableThinking = process.env.ENABLE_THINKING !== 'false';
 
     // 从 base64 FP 环境变量解析指纹
     if (process.env.FP) {

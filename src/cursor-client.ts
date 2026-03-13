@@ -11,6 +11,7 @@
 
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
 import { getConfig } from './config.js';
+import { getProxyFetchOptions } from './proxy-agent.js';
 
 const CURSOR_CHAT_API = 'https://cursor.com/api/chat';
 
@@ -36,6 +37,7 @@ function getChromeHeaders(): Record<string, string> {
         'priority': 'u=1, i',
         'user-agent': config.fingerprint.userAgent,
         'x-is-human': '',  // Cursor 不再校验此字段
+        'anthropic-beta': 'max-tokens-3-5-sonnet-2024-07-15'
     };
 }
 
@@ -74,10 +76,25 @@ async function sendCursorRequestInner(
 
     console.log(`[Cursor] 发送请求: model=${req.model}, messages=${req.messages.length}`);
 
-    // 请求级超时（使用配置值）
     const config = getConfig();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), config.timeout * 1000);
+
+    // ★ 空闲超时（Idle Timeout）：用读取活动检测替换固定总时长超时。
+    // 每次收到新数据时重置计时器，只有在指定时间内完全无数据到达时才中断。
+    // 这样长输出（如写长文章、大量工具调用）不会因总时长超限被误杀。
+    const IDLE_TIMEOUT_MS = config.timeout * 1000; // 复用 timeout 配置作为空闲超时阈值
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const resetIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+            console.warn(`[Cursor] 空闲超时（${config.timeout}s 无新数据），中止请求`);
+            controller.abort();
+        }, IDLE_TIMEOUT_MS);
+    };
+
+    // 启动初始计时（等待服务器开始响应）
+    resetIdleTimer();
 
     try {
         const resp = await fetch(CURSOR_CHAT_API, {
@@ -85,7 +102,8 @@ async function sendCursorRequestInner(
             headers,
             body: JSON.stringify(req),
             signal: controller.signal,
-        });
+            ...getProxyFetchOptions(),
+        } as any);
 
         if (!resp.ok) {
             const body = await resp.text();
@@ -104,6 +122,9 @@ async function sendCursorRequestInner(
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+
+            // 每次收到数据就重置空闲计时器
+            resetIdleTimer();
 
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
@@ -134,7 +155,7 @@ async function sendCursorRequestInner(
             }
         }
     } finally {
-        clearTimeout(timeout);
+        if (idleTimer) clearTimeout(idleTimer);
     }
 }
 

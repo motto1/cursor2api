@@ -70,6 +70,7 @@ export interface OpenAIChatChoice {
     message: {
         role: 'assistant';
         content: string | null;
+        reasoning_content?: string;
         tool_calls?: OpenAIToolCall[];
     };
     finish_reason: 'stop' | 'tool_calls' | 'length' | null;
@@ -90,6 +91,7 @@ export interface OpenAIStreamChoice {
     delta: {
         role?: 'assistant';
         content?: string | null;
+        reasoning_content?: string;
         tool_calls?: OpenAIStreamToolCall[];
     };
     finish_reason: 'stop' | 'tool_calls' | 'length' | null;
